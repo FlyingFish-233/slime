@@ -106,6 +106,7 @@ class Sample:
     rollout_id: int | None = None
     # prompt
     prompt: str | list[dict[str, str]] = ""
+    rendered_text: str | None = None
     tokens: list[int] = field(default_factory=list)
     multimodal_inputs: dict[str, Any] | None = None  # raw multimodal data, e.g. images, videos, etc.
     multimodal_train_inputs: dict[str, Any] | None = None  # processed multimodal data, e.g. pixel_values, etc.

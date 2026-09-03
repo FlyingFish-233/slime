@@ -52,6 +52,14 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
                 f"SFT rollout produced mismatched token_ids/loss_mask lengths: {len(token_ids)=}, {len(loss_mask)=}"
             )
 
+        if getattr(args, "save_debug_rollout_data", None) is not None:
+            sample.rendered_text = TOKENIZER.apply_chat_template(
+                messages,
+                tokenize=False,
+                tools=tools,
+                return_dict=False,
+            )
+
         response_length = MASK_GENERATOR.get_response_lengths([loss_mask])[0]
 
         sample.tokens = token_ids
