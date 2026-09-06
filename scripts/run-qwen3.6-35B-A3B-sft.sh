@@ -169,4 +169,5 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py \
   --output-dir "${HF_OUTPUT_DIR}" \
   --origin-hf-dir "${MODEL_DIR}" \
   --vocab-size 248320 \
+  --add-missing-from-origin-hf \
   --force

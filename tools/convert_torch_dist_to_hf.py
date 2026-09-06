@@ -141,7 +141,7 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
                             current_size = 0
                         modeltensors[-1][converted_name] = converted_param
                         current_size += tensor_size
-                    total_size += tensor_size
+                        total_size += tensor_size
 
     metadata = {"metadata": {"total_size": total_size}, "weight_map": {}}
 
