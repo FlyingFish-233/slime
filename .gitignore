@@ -195,3 +195,4 @@ _examples_synced/
 .DS_Store
 
 sft_dumps/
+memory_snapshots/

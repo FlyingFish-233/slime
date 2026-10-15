@@ -630,7 +630,7 @@ def train_one_step(
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
-            output_tensor = model(**forward_kwargs)
+            output_tensor = model(**forward_kwargs, fp32_output=False)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage

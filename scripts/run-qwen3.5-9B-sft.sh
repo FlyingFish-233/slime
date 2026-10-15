@@ -52,13 +52,16 @@ if find "${SLIME_CKPT_DIR}" -type f -print -quit 2>/dev/null | grep -q .; then
 fi
 
 SFT_ARGS=(
-  --rollout-function-path slime.rollout.sft_rollout.generate_rollout
+  --rollout-function-path slime.rollout.sft_rollout_ultra.generate_rollout
   --prompt-data "${DATA_FILE}"
+  --seq-length 200000
   --input-key messages
   --rollout-shuffle
   --num-epoch 3
   --rollout-batch-size 8
   --global-batch-size 8
+  --log-probs-chunk-size 4096
+  --recompute-loss-function
 
   --loss-type sft_loss
   --loss-mask-type qwen3_5
@@ -115,7 +118,13 @@ MISC_ARGS=(
   --accumulate-allreduce-grads-in-fp32
   --attention-softmax-in-fp32
   --attention-backend flash
+  # --log-device-memory-used
+  --record-memory-history
+  --memory-snapshot-dir /root/slime/memory_snapshots
+  --memory-snapshot-num-steps 3
 )
+
+mkdir -p /root/slime/memory_snapshots
 
 ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus 8 \
   --disable-usage-stats \
@@ -133,7 +142,14 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
+RAY_JOB_ID="qwen35-9B-sft-$(date +%Y%m%d-%H%M%S)-$$"
+
+# Submit asynchronously, then wait for the Ray job explicitly. The default
+# log streaming connection can close while the job is still running, which
+# would otherwise race ahead to checkpoint conversion.
 ray job submit --address="http://127.0.0.1:8265" \
+  --submission-id="${RAY_JOB_ID}" \
+  --no-wait \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 train_async.py \
   --actor-num-nodes 1 \
@@ -145,6 +161,29 @@ ray job submit --address="http://127.0.0.1:8265" \
   "${WANDB_ARGS[@]}" \
   "${PERF_ARGS[@]}" \
   "${MISC_ARGS[@]}"
+
+while true; do
+  job_status="$(ray job status --address="http://127.0.0.1:8265" "${RAY_JOB_ID}" 2>&1 || true)"
+  job_status_lower="$(printf '%s' "${job_status}" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "${job_status_lower}" == *succeeded* ]]; then
+    echo "Ray job ${RAY_JOB_ID} succeeded."
+    break
+  fi
+  if [[ "${job_status_lower}" == *failed* || "${job_status_lower}" == *stopped* ]]; then
+    printf '%s\n' "${job_status}" >&2
+    echo "Ray job ${RAY_JOB_ID} did not complete successfully." >&2
+    exit 1
+  fi
+
+  echo "Ray job ${RAY_JOB_ID} is still running; checking again in 30 seconds."
+  sleep 30
+done
+
+[[ -f "${SLIME_CKPT_DIR}/latest_checkpointed_iteration.txt" ]] || {
+  echo "Missing latest checkpoint iteration file: ${SLIME_CKPT_DIR}/latest_checkpointed_iteration.txt" >&2
+  exit 1
+}
 
 latest_iteration="$(tr -d "[:space:]" < "${SLIME_CKPT_DIR}/latest_checkpointed_iteration.txt")"
 [[ "${latest_iteration}" =~ ^[0-9]+$ ]] || {
