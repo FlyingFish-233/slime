@@ -4,6 +4,9 @@ set -euo pipefail
 # Single-node training: keep all runtime state inside the container and use all
 # eight visible GPUs.
 export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export NCCL_BUFFSIZE=1048576
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export no_proxy="127.0.0.1,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
@@ -46,18 +49,21 @@ CKPT_ARGS=(
 )
 
 # Resume only when an actual training checkpoint exists.
-if find "${SLIME_CKPT_DIR}" -type f -print -quit 2>/dev/null | grep -q .; then
+if [[ -f "${SLIME_CKPT_DIR}/latest_checkpointed_iteration.txt" ]]; then
   CKPT_ARGS+=(--load "${SLIME_CKPT_DIR}")
 fi
 
 SFT_ARGS=(
-  --rollout-function-path slime.rollout.sft_rollout.generate_rollout
+  --rollout-function-path slime.rollout.sft_rollout_ultra.generate_rollout
   --prompt-data "${DATA_FILE}"
+  --seq-length 200000
   --input-key messages
   --rollout-shuffle
   --num-epoch 3
   --rollout-batch-size 8
   --global-batch-size 8
+  --log-probs-chunk-size 1024
+  --recompute-loss-function
 
   --loss-type sft_loss
   --loss-mask-type qwen3_5
@@ -68,22 +74,24 @@ SFT_ARGS=(
 )
 
 PERF_ARGS=(
-  # CP and EP reuse the same eight ranks in their respective process groups:
-  # CP=8 handles this dataset's 85k-token maximum, while EP=8 places 32 of the
-  # 256 experts on each GPU. TP=2 together with CP=8/EP=8 needs more than 8 GPUs.
-  --tensor-model-parallel-size 1
+  # Linear attention is duplicated across TP/CP ranks in this model adapter.
+  # TP=8 reduces the remaining dense weights without a redundant CP gather.
+  # The independent EP=8 group keeps 32 of 256 experts on each GPU.
+  --tensor-model-parallel-size 8
+  --sequence-parallel
   --pipeline-model-parallel-size 1
-  --context-parallel-size 8
+  --context-parallel-size 1
   --expert-model-parallel-size 8
   --expert-tensor-parallel-size 1
+  --qwen-gdn-head-chunk-size 8
 
   --recompute-granularity full
   --recompute-method uniform
   --recompute-num-layers 1
 
   --use-dynamic-batch-size
-  # 8 * 12288 = 98304 tokens of total CP capacity per micro-batch.
-  --max-tokens-per-gpu 12288
+  # Packing budget; a single longer sample occupies its own micro-batch.
+  --max-tokens-per-gpu 4096
 )
 
 OPTIMIZER_ARGS=(
@@ -133,6 +141,9 @@ RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+    \"OMP_NUM_THREADS\": \"8\",
+    \"MKL_NUM_THREADS\": \"8\",
+    \"NCCL_BUFFSIZE\": \"1048576\",
     \"NCCL_NVLS_ENABLE\": \"0\",
     \"no_proxy\": \"${no_proxy}\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
@@ -140,7 +151,11 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
+RAY_JOB_ID="qwen36-35B-sft-$(date +%Y%m%d-%H%M%S)-$$"
+
 ray job submit --address="http://127.0.0.1:8265" \
+  --submission-id="${RAY_JOB_ID}" \
+  --no-wait \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 train_async.py \
   --actor-num-nodes 1 \
@@ -153,6 +168,28 @@ ray job submit --address="http://127.0.0.1:8265" \
   "${PERF_ARGS[@]}" \
   "${MISC_ARGS[@]}"
 
+while true; do
+  job_status="$(ray job status --address="http://127.0.0.1:8265" "${RAY_JOB_ID}" 2>&1)" || {
+    echo "Cannot query Ray job ${RAY_JOB_ID}: ${job_status}" >&2
+    exit 1
+  }
+  job_status_lower="$(printf '%s' "${job_status}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${job_status_lower}" == *succeeded* ]]; then
+    echo "Ray job ${RAY_JOB_ID} succeeded."
+    break
+  fi
+  if [[ "${job_status_lower}" == *failed* || "${job_status_lower}" == *stopped* ]]; then
+    printf '%s\n' "${job_status}" >&2
+    exit 1
+  fi
+  echo "Ray job ${RAY_JOB_ID} is still running; checking again in 30 seconds."
+  sleep 30
+done
+
+[[ -f "${SLIME_CKPT_DIR}/latest_checkpointed_iteration.txt" ]] || {
+  echo "Missing latest checkpoint iteration file." >&2
+  exit 1
+}
 latest_iteration="$(tr -d "[:space:]" < "${SLIME_CKPT_DIR}/latest_checkpointed_iteration.txt")"
 [[ "${latest_iteration}" =~ ^[0-9]+$ ]] || {
   echo "Invalid latest checkpoint iteration: ${latest_iteration}" >&2

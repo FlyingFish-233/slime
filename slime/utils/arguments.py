@@ -114,6 +114,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="GDN implementation backend for Qwen linear-attention layers.",
             )
             parser.add_argument(
+                "--qwen-gdn-head-chunk-size", type=int, default=0,
+                help="Recompute GDN in groups of this many heads to reduce peak memory; 0 disables it.",
+            )
+            parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
                 default="{}",

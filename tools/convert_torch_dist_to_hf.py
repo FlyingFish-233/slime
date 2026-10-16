@@ -63,7 +63,7 @@ class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
-def get_expert_param(args, name, param):
+def get_expert_param(args, name, param, fused_experts=False):
     if ".experts." not in name:
         yield name, param
         return
@@ -72,15 +72,21 @@ def get_expert_param(args, name, param):
     match = re.search(r"mlp.experts\.(.+)\.weight(\d+)", name)
     if not match:
         assert param.shape[0] == num_experts
+        if fused_experts:
+            expert_name = name.replace(".experts.experts.", ".experts.").removesuffix(".weight")
+            yield expert_name, param
+            return
         for expert_id in range(num_experts):
             expert_name = name.replace(".experts.experts.", ".experts.") + str(expert_id)
             expert_param = param[expert_id]
             yield expert_name, expert_param
     else:
+        if fused_experts:
+            raise ValueError("Fused HF expert export requires a grouped expert checkpoint")
         yield name, param
 
 
-def get_layer_param(args, name, param):
+def get_layer_param(args, name, param, fused_experts=False):
     if ".layers." not in name:
         yield name, param
         return
@@ -92,15 +98,15 @@ def get_layer_param(args, name, param):
         for layer_id in range(num_layers):
             layer_name = name.replace(".layers.", f".layers.{layer_id}.")
             layer_param = param[layer_id]
-            yield from get_expert_param(args, layer_name, layer_param)
+            yield from get_expert_param(args, layer_name, layer_param, fused_experts)
     else:
-        yield from get_expert_param(args, name, param)
+        yield from get_expert_param(args, name, param, fused_experts)
 
 
-def get_named_params(args, state_dict):
+def get_named_params(args, state_dict, fused_experts=False):
     for name, param in state_dict.items():
         name = f"module.module.{name}"
-        yield from get_layer_param(args, name, param)
+        yield from get_layer_param(args, name, param, fused_experts)
 
 
 def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_size=None, origin_hf_dir=None):
@@ -111,7 +117,14 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
     total_size = 0
     modeltensors = [{}]
     converted_names = set()
-    for name, param in get_named_params(args, state_dict):
+    fused_experts = False
+    normalized_model = model_name.lower().replace("_", "").replace("-", "")
+    if origin_hf_dir is not None and "qwen35" in normalized_model:
+        index_path = os.path.join(origin_hf_dir, "model.safetensors.index.json")
+        with open(index_path) as stream:
+            origin_names = json.load(stream)["weight_map"]
+        fused_experts = any(name.endswith(".mlp.experts.gate_up_proj") for name in origin_names)
+    for name, param in get_named_params(args, state_dict, fused_experts):
         if vocab_size:
             param = remove_padding(name, param, vocab_size)
         converted_named_tensors = convert_to_hf(args, model_name, name, param)
@@ -131,6 +144,8 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
             with safetensors.safe_open(os.path.join(origin_hf_dir, filename), framework="pt", device="cpu") as f:
                 for k in f.keys():
                     if k not in converted_names:
+                        if "qwen35" in normalized_model and (k.startswith("model.language_model.") or k == "lm_head.weight"):
+                            raise ValueError(f"Missing trained language-model tensor; refusing origin fallback: {k}")
                         converted_name = k
                         print(f"add {k} from origin hf checkpoint")
                         converted_param = f.get_tensor(k)

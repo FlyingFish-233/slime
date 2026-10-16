@@ -478,6 +478,7 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     top_p_token_ids: list[list[int]] | None = None,
     top_p_token_offsets: list[list[int]] | None = None,
+    recompute_chunks: bool = False,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -533,6 +534,7 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        recompute_chunks=recompute_chunks,
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
@@ -1199,6 +1201,7 @@ def sft_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=False,
+        recompute_chunks=getattr(args, "recompute_loss_function", False),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1273,7 +1276,10 @@ def loss_function(
         case _:
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
-    if args.recompute_loss_function:
+    # Whole-loss recomputation recreates all SFT softmax chunks together during
+    # backward. SFT instead checkpoints each chunk to bound vocabulary buffers.
+    chunked_sft_recompute = args.loss_type == "sft_loss" and args.log_probs_chunk_size > 0
+    if args.recompute_loss_function and not chunked_sft_recompute:
         loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)

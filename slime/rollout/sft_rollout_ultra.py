@@ -15,11 +15,17 @@ SAMPLE_PRINTED = False
 
 
 def _truncate_rollout(token_ids, loss_mask, max_length):
+    if len(token_ids) != len(loss_mask):
+        raise ValueError("SFT token_ids and loss_mask must have equal lengths")
+    if max_length is not None and max_length <= 0:
+        raise ValueError("SFT max_length must be positive")
+    if 1 not in loss_mask:
+        raise ValueError("SFT sample has no assistant targets")
     if max_length is None or len(token_ids) <= max_length:
         return token_ids, loss_mask, False
 
-    token_ids = token_ids[-max_length:]
-    loss_mask = loss_mask[-max_length:]
+    token_ids = token_ids[:max_length]
+    loss_mask = loss_mask[:max_length]
     if 1 not in loss_mask:
         raise ValueError(
             f"Truncation removed all assistant targets: {len(token_ids)=}, {max_length=}. "
@@ -78,7 +84,13 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
             )
 
         original_length = len(token_ids)
-        token_ids, loss_mask, was_truncated = _truncate_rollout(token_ids, loss_mask, max_seq_length)
+        try:
+            token_ids, loss_mask, was_truncated = _truncate_rollout(token_ids, loss_mask, max_seq_length)
+        except ValueError as exc:
+            raise ValueError(
+                f"SFT rollout_id={rollout_id}, batch_index={i}, "
+                f"sample_index={getattr(sample, 'index', None)}: {exc}"
+            ) from exc
         truncated_count += int(was_truncated)
 
         response_length = MASK_GENERATOR.get_response_lengths([loss_mask])[0]
@@ -87,22 +99,24 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
         sample.response_length = response_length
         sample.reward = 0
         sample.loss_mask = loss_mask[-response_length:]
+        sample.metadata["sft_original_length"] = original_length
+        sample.metadata["sft_supervised_tokens"] = sum(loss_mask)
         if was_truncated:
             sample.metadata["sft_truncated"] = True
-            sample.metadata["sft_original_length"] = original_length
 
         if i == 0 and not SAMPLE_PRINTED:
             logger.info(
-                f"sft_rollout::generate_rollout example data: {sample=} (raw){messages=} (raw){token_ids=} (raw){loss_mask=} {response_length=}"
+                "SFT example: original_length=%d, length=%d, response_length=%d, supervised_tokens=%d",
+                original_length, len(token_ids), response_length, sum(loss_mask),
             )
             SAMPLE_PRINTED = True
 
     if truncated_count:
         logger.info(
-            "sft_rollout truncated %d/%d samples to seq_length=%d",
+            "sft_rollout kept first %d tokens for %d/%d samples",
+            max_seq_length,
             truncated_count,
             len(samples),
-            max_seq_length,
         )
 
     return samples

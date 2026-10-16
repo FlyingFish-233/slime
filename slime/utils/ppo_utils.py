@@ -743,6 +743,44 @@ def chunked_gae(
     return advantages, returns
 
 
+class _RecomputedChunkedLogProb(torch.autograd.Function):
+    """SFT log-probs with one vocabulary chunk live during backward.
+
+    Assemble the input gradient directly instead of retaining every chunk's
+    softmax or accumulating chunk gradients for a second full-size concat.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, tokens, tp_group, chunk_size):
+        ctx.save_for_backward(logits, tokens)
+        ctx.tp_group = tp_group
+        ctx.chunk_size = chunk_size
+        outputs = []
+        for start in range(0, logits.size(0), chunk_size):
+            log_prob, _ = _calculate_log_probs_and_entropy_chunk(
+                logits[start : start + chunk_size], tokens[start : start + chunk_size],
+                tp_group, with_entropy=False, log_prob_keep_mask=None,
+            )
+            outputs.append(log_prob)
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, tokens = ctx.saved_tensors
+        grad_logits = torch.empty_like(logits)
+        for start in range(0, logits.size(0), ctx.chunk_size):
+            end = start + ctx.chunk_size
+            with torch.enable_grad():
+                chunk = logits[start:end].detach().requires_grad_(True)
+                log_prob, _ = _calculate_log_probs_and_entropy_chunk(
+                    chunk, tokens[start:end], ctx.tp_group, with_entropy=False, log_prob_keep_mask=None,
+                )
+                (grad_chunk,) = torch.autograd.grad(log_prob, chunk, grad_output[start:end])
+            grad_logits[start:end].copy_(grad_chunk)
+            del chunk, log_prob, grad_chunk
+        return grad_logits, None, None, None
+
+
 def calculate_log_probs_and_entropy(
     logits,
     tokens,
@@ -751,8 +789,13 @@ def calculate_log_probs_and_entropy(
     chunk_size: int = -1,
     log_prob_keep_mask=None,
     with_entropy_grad: bool = True,
+    recompute_chunks: bool = False,
 ):
     logits = logits.contiguous()
+    if recompute_chunks and (with_entropy or log_prob_keep_mask is not None):
+        raise ValueError("Chunk recomputation supports unmasked SFT log-probs without entropy")
+    if recompute_chunks and chunk_size > 0 and logits.size(0) > 0:
+        return _RecomputedChunkedLogProb.apply(logits, tokens, tp_group, chunk_size), None
     entropy = None
     if logits.size(0) != 0:
         if chunk_size > 0:

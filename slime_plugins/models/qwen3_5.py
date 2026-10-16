@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
@@ -15,6 +16,7 @@ except ImportError:
     pass
 
 from .hf_attention import HuggingfaceAttention, _load_hf_config
+from .chunked_gdn import head_chunked_gdn
 from .qwen_gdn_backend import get_chunk_gated_delta_rule
 
 
@@ -23,6 +25,23 @@ def _get_text_config(hf_config):
     if hasattr(hf_config, "text_config"):
         return hf_config.text_config
     return hf_config
+
+
+class GatedSelfAttention(SelfAttention):
+    """Keep output gates aligned with query heads when TP exceeds KV heads."""
+
+    def get_query_key_value_tensors(self, *args, **kwargs):
+        result = super().get_query_key_value_tensors(*args, **kwargs)
+        if len(result) == 4:
+            query, key, value, gate = result
+            # Megatron slices query after replicating KV groups, but older
+            # versions return the entire group's gates. Accept fixed versions too.
+            if gate.size(2) != query.size(2):
+                replicas = self.world_size // self.config.num_query_groups
+                index = self.pg_collection.tp.rank() % replicas
+                gate = gate.narrow(2, index * query.size(2), query.size(2)).contiguous()
+            return query, key, value, gate
+        return result
 
 
 # Adapted from Qwen3NextGatedDeltaNet but with separate in_proj_qkv and in_proj_z
@@ -36,6 +55,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(self, config, layer_idx: int, args=None):
         super().__init__()
         self.gdn_backend = getattr(args, "qwen_gdn_backend", "fla")
+        self.head_chunk_size = getattr(args, "qwen_gdn_head_chunk_size", 0)
+        if self.head_chunk_size < 0:
+            raise ValueError("qwen_gdn_head_chunk_size must be nonnegative")
         self.chunk_gated_delta_rule = get_chunk_gated_delta_rule(self.gdn_backend)
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
@@ -127,17 +149,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             g = g.contiguous()
             beta = beta.contiguous()
 
-        core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-        )
+        if self.head_chunk_size and self.head_chunk_size < self.num_v_heads:
+            core_attn_out = head_chunked_gdn(
+                query, key, value, g, beta, cu_seqlens,
+                self.chunk_gated_delta_rule, self.head_chunk_size,
+            )
+        else:
+            core_attn_out, _ = self.chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -229,5 +257,9 @@ def get_qwen3_5_spec(args, config, vp_stage):
                 module=Attention,
                 params={"args": args},
             )
+            transformer_layer_spec.layer_specs[layer_id] = layer_specs
+        elif getattr(args, "attention_output_gate", False) and args.tensor_model_parallel_size > args.num_query_groups:
+            layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
+            layer_specs.submodules.self_attention.module = GatedSelfAttention
             transformer_layer_spec.layer_specs[layer_id] = layer_specs
     return transformer_layer_spec
