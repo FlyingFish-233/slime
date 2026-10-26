@@ -192,6 +192,8 @@ train_rollout_diff_exp/results/
 
 glm/
 _examples_synced/
+sft_dumps/
+memory_snapshots/
 .env
 .DS_Store
 
