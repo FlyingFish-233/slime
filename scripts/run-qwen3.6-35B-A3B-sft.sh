@@ -54,7 +54,7 @@ if [[ -f "${SLIME_CKPT_DIR}/latest_checkpointed_iteration.txt" ]]; then
 fi
 
 SFT_ARGS=(
-  --rollout-function-path slime.rollout.sft_rollout.generate_rollout
+  --rollout-function-path slime.rollout.sft_rollout_ultra.generate_rollout
   --prompt-data "${DATA_FILE}"
   --seq-length 200000
   --input-key messages
@@ -69,7 +69,7 @@ SFT_ARGS=(
   --calculate-per-token-loss
   --disable-compute-advantages-and-returns
   --debug-train-only
-  # --save-debug-rollout-data "/root/slime/sft_dumps/rollout_{rollout_id}.pt"
+  --save-debug-rollout-data "/root/slime/sft_dumps/rollout_{rollout_id}.pt"
 )
 
 PERF_ARGS=(
