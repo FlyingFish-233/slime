@@ -30,7 +30,17 @@ def _truncate_rollout(token_ids, loss_mask, max_length):
             f"Truncation to the first {max_length} tokens removed all assistant targets "
             f"from a {original_length}-token sample"
         )
-    return token_ids, loss_mask, original_length > max_length
+
+    was_truncated = original_length > max_length
+    tail_masked_tokens_removed = 0
+    if was_truncated:
+        # Causal attention means tokens after the final supervised target cannot
+        # affect any loss-bearing position, so they only consume compute.
+        last_target = len(loss_mask) - 1 - loss_mask[::-1].index(1)
+        tail_masked_tokens_removed = len(loss_mask) - last_target - 1
+        token_ids = token_ids[: last_target + 1]
+        loss_mask = loss_mask[: last_target + 1]
+    return token_ids, loss_mask, was_truncated, tail_masked_tokens_removed
 
 
 def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
@@ -63,7 +73,9 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
 
         original_length = len(token_ids)
         try:
-            token_ids, loss_mask, was_truncated = _truncate_rollout(token_ids, loss_mask, args.seq_length)
+            token_ids, loss_mask, was_truncated, tail_masked_tokens_removed = _truncate_rollout(
+                token_ids, loss_mask, args.seq_length
+            )
         except ValueError as exc:
             raise ValueError(
                 f"SFT rollout_id={rollout_id}, batch_index={i}, "
@@ -80,6 +92,7 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
         sample.metadata["sft_original_length"] = original_length
         sample.metadata["sft_truncated"] = was_truncated
         sample.metadata["sft_supervised_tokens"] = sum(loss_mask)
+        sample.metadata["sft_tail_masked_tokens_removed"] = tail_masked_tokens_removed
 
         if i == 0 and not SAMPLE_PRINTED:
             logger.info(

@@ -43,19 +43,20 @@ def _run_rollout(monkeypatch, token_ids, loss_mask, seq_length, *, debug=True):
 def test_keeps_first_tokens_and_exports_full_rendered_text(monkeypatch, tmp_path):
     sample = _run_rollout(monkeypatch, [10, 11, 12, 13, 14], [0, 1, 0, 1, 1], 3)
 
-    assert sample.tokens == [10, 11, 12]
-    assert sample.response_length == 2
-    assert sample.loss_mask == [1, 0]
+    assert sample.tokens == [10, 11]
+    assert sample.response_length == 1
+    assert sample.loss_mask == [1]
     assert sample.metadata == {
         "sft_original_length": 5,
         "sft_truncated": True,
         "sft_supervised_tokens": 1,
+        "sft_tail_masked_tokens_removed": 1,
     }
 
     save_debug_rollout_data(str(tmp_path / "rollout_{rollout_id}.pt"), [sample], rollout_id=12, evaluation=False)
     saved = torch.load(tmp_path / "rollout_12.pt", weights_only=False)["samples"][0]
     assert saved["rendered_text"] == "<|im_start|>assistant\nfull rendered message<|im_end|>"
-    assert saved["tokens"] == [10, 11, 12]
+    assert saved["tokens"] == [10, 11]
 
 
 def test_rejects_prefix_without_assistant_targets(monkeypatch):
@@ -68,4 +69,12 @@ def test_keeps_short_sample_intact(monkeypatch):
     assert sample.tokens == [10, 11]
     assert sample.loss_mask == [1]
     assert sample.metadata["sft_truncated"] is False
+    assert sample.metadata["sft_tail_masked_tokens_removed"] == 0
     assert not hasattr(sample, "rendered_text")
+
+
+def test_truncated_prefix_ending_with_target_keeps_all_tokens(monkeypatch):
+    sample = _run_rollout(monkeypatch, [10, 11, 12, 13], [0, 1, 1, 0], 3)
+    assert sample.tokens == [10, 11, 12]
+    assert sample.loss_mask == [1, 1]
+    assert sample.metadata["sft_tail_masked_tokens_removed"] == 0
