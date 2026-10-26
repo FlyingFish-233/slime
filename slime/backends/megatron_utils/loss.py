@@ -597,6 +597,7 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        reuse_logits_for_grad=args.loss_type == "sft_loss" and not with_entropy,
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 

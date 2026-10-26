@@ -894,7 +894,7 @@ class _ChunkedLogProbEntropy(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, logits, tokens, keep_mask, tp_group, with_entropy, with_entropy_grad, chunk_size):
+    def forward(ctx, logits, tokens, keep_mask, tp_group, with_entropy, with_entropy_grad, chunk_size, reuse_logits_for_grad):
         log_prob = torch.empty((logits.size(0), 1), device=logits.device, dtype=torch.float32)
         entropy = log_prob.new_empty((logits.size(0),) if with_entropy else (0,))
         for start in range(0, logits.size(0), chunk_size):
@@ -914,6 +914,7 @@ class _ChunkedLogProbEntropy(torch.autograd.Function):
         ctx.tp_group = tp_group
         ctx.with_entropy_grad = with_entropy and with_entropy_grad
         ctx.chunk_size = chunk_size
+        ctx.reuse_logits_for_grad = reuse_logits_for_grad
         if not ctx.with_entropy_grad:
             ctx.mark_non_differentiable(entropy)
         return log_prob, entropy
@@ -922,7 +923,10 @@ class _ChunkedLogProbEntropy(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_log_prob, grad_entropy):
         logits, tokens, keep_mask = ctx.saved_tensors
-        grad_input = torch.empty_like(logits)
+        # For SFT, logits have no other consumer after this loss. Reuse their
+        # storage for the returned gradient to avoid a second full [T, V]
+        # allocation at long context lengths.
+        grad_input = logits.detach() if ctx.reuse_logits_for_grad else torch.empty_like(logits)
         for start in range(0, logits.size(0), ctx.chunk_size):
             end = min(start + ctx.chunk_size, logits.size(0))
             with torch.enable_grad():
@@ -942,7 +946,7 @@ class _ChunkedLogProbEntropy(torch.autograd.Function):
                 (gradient,) = torch.autograd.grad(outputs, chunk, grad_outputs=gradients)
             grad_input[start:end] = gradient
             del gradient, outputs, gradients, values, entropies, chunk
-        return grad_input, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None
 
 
 def calculate_log_probs_and_entropy(
@@ -953,13 +957,17 @@ def calculate_log_probs_and_entropy(
     chunk_size: int = -1,
     log_prob_keep_mask=None,
     with_entropy_grad: bool = True,
+    reuse_logits_for_grad: bool = False,
 ):
     logits = logits.contiguous()
     entropy = None
     if logits.size(0) != 0:
         if chunk_size > 0:
+            if reuse_logits_for_grad and logits.is_leaf:
+                raise ValueError("Cannot reuse a leaf logits tensor for its gradient")
             log_prob, entropy = _ChunkedLogProbEntropy.apply(
-                logits, tokens, log_prob_keep_mask, tp_group, with_entropy, with_entropy_grad, chunk_size
+                logits, tokens, log_prob_keep_mask, tp_group, with_entropy, with_entropy_grad, chunk_size,
+                reuse_logits_for_grad,
             )
             if not with_entropy:
                 entropy = None
